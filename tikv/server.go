@@ -14,6 +14,7 @@
 package tikv
 
 import (
+	"bytes"
 	"context"
 	"io"
 	"sync"
@@ -511,6 +512,55 @@ func (svr *Server) Coprocessor(ctx context.Context, req *coprocessor.Request) (*
 	}
 	return cophandler.HandleCopRequest(reqCtx.getDBReader(), svr.mvccStore.lockStore, req), nil
 }
+
+func (svr *Server) BCoprocessor(ctx context.Context, req *coprocessor.BatchRequest) (*coprocessor.BatchResponse, error) {
+	var dbReaders *dbreader.DBReader
+	var ranges []*coprocessor.KeyRange
+	var try, retry []*coprocessor.RegionInfo
+	try,retry = req.Regions, nil
+	for len(try) > 0 {
+		for _, region := range try {
+			req.Context.RegionEpoch = region.RegionEpoch
+			req.Context.RegionId = region.RegionId
+			reqCtx, err := newRequestCtx(svr, req.Context, "BatchCoprocessor")
+			if err != nil {
+				return &coprocessor.BatchResponse{OtherError: convertToKeyError(err).String()}, nil
+			}
+			if reqCtx.regErr != nil {
+				reqCtx.finish()
+				retry = append(retry, region)
+				continue
+			}
+			dbReaders = mergeDBReaderRange(dbReaders,reqCtx.getDBReader())
+			ranges = append(ranges, region.Ranges...)
+			defer reqCtx.finish()
+		}
+		try, retry = retry, nil
+	}
+
+	mockRequest := &coprocessor.Request{
+		Context:              req.Context,
+		Tp:                   req.Tp,
+		Data:                 req.Data,
+		StartTs:              req.StartTs,
+		Ranges:               ranges,
+		SchemaVer:            req.SchemaVer,
+	}
+	return &coprocessor.BatchResponse{Data: cophandler.HandleCopRequest(dbReaders, svr.mvccStore.lockStore, mockRequest).Data}, nil
+}
+
+func mergeDBReaderRange(dbA *dbreader.DBReader,dbB *dbreader.DBReader) *dbreader.DBReader {
+	if dbA == nil {return dbB}
+	if dbB == nil {return dbA}
+	if (dbA.StartKey!=nil && bytes.Compare(dbB.StartKey,dbA.StartKey) > 0 ) || dbA.StartKey == nil{
+		dbB.StartKey = dbA.StartKey
+	}
+	if (dbA.EndKey!=nil && bytes.Compare(dbB.EndKey, dbA.EndKey) < 0) || dbA.EndKey == nil{
+		dbB.EndKey = dbA.EndKey
+	}
+	return dbB
+}
+
 
 func (svr *Server) CoprocessorStream(*coprocessor.Request, tikvpb.Tikv_CoprocessorStreamServer) error {
 	// TODO
